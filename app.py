@@ -30,8 +30,10 @@ def load_roster() -> pd.DataFrame:
     if missing:
         raise ValueError(f"Missing columns in sheet: {missing}. Expected {required}")
 
-    df["Name"] = df["Name"].astype(str).str.strip()
-    df["Role_Capability"] = df["Role_Capability"].astype(str)
+    # CHANGED: fill blanks so NaNs don't become the string "nan"
+    df["Name"] = df["Name"].fillna("").astype(str).str.strip()
+    df["Role_Capability"] = df["Role_Capability"].fillna("").astype(str)
+
     df["Fairness_Score"] = pd.to_numeric(df["Fairness_Score"], errors="coerce").fillna(0).astype(int)
     return df
 
