@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import date
-from st_gsheets_connection import GSheetsConnection
+from streamlit_gsheets import GSheetsConnection
 
 st.set_page_config(page_title="Volunteer Scheduler V1", layout="wide")
 st.title("Volunteer Scheduler V1 (Blackjack Fairness)")
