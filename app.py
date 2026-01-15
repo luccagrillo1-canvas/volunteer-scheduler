@@ -6,7 +6,7 @@ import random
 import re
 from typing import Dict, List, Tuple, Optional
 
-from st_gsheets_connection import GSheetsConnection
+from st_gsheets_connection import GSheetsConnection  # <-- correct for st-gsheets-connection
 
 # =========================
 # App config
@@ -91,7 +91,6 @@ def load_roster(roster_ws: str) -> pd.DataFrame:
     df["Name"] = df["Name"].astype(str).str.strip()
     df["TrueCount"] = pd.to_numeric(df["TrueCount"], errors="coerce").fillna(0).astype(int)
 
-    # Keep original strings in sheet, but use list form inside app
     df["PreferredCameras"] = df["PreferredCameras"].apply(parse_cameras_cell_to_list)
     df["AvoidCameras"] = df["AvoidCameras"].apply(parse_cameras_cell_to_list)
 
@@ -320,7 +319,7 @@ def apply_commit(
     commit_option: Dict,
     role_truecount_delta: Dict[str, int],
     batch_id: str,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> None:
     now_iso = utc_now_iso()
     date_str = service_date.isoformat()
 
@@ -354,11 +353,8 @@ def apply_commit(
         }
         updated_log = pd.concat([updated_log, pd.DataFrame([new_row])], ignore_index=True)
 
-    # Write back
     conn.update(worksheet=roster_ws, data=updated_roster[ROSTER_COLS])
     conn.update(worksheet=log_ws, data=updated_log[LOG_COLS])
-
-    return updated_roster, updated_log
 
 
 def undo_last_commit(
@@ -366,7 +362,7 @@ def undo_last_commit(
     log_df: pd.DataFrame,
     roster_ws: str,
     log_ws: str,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> None:
     if log_df is None or len(log_df) == 0:
         raise ValueError("Schedule_Log is empty. Nothing to undo.")
 
@@ -410,30 +406,22 @@ def undo_last_commit(
     conn.update(worksheet=roster_ws, data=updated_roster[ROSTER_COLS])
     conn.update(worksheet=log_ws, data=updated_log[LOG_COLS])
 
-    return updated_roster, updated_log
 
-
-def full_reset(roster_ws: str, log_ws: str) -> None:
+def full_data_clear_keep_headers(roster_ws: str, log_ws: str) -> None:
     """
-    Full reset:
-      - sets TrueCount=0 for all roster rows
-      - clears LastRun for all roster rows
-      - clears Schedule_Log completely (keeps headers)
-    Does not touch Name or any other roster columns so you can type new names later.
+    Hard wipe:
+      - Roster tab becomes ONLY the header row (no people)
+      - Schedule_Log tab becomes ONLY the header row (no rows)
     """
+    # Ensure roster exists and has the expected headers (so you get a clear error if wrong)
     roster_df = conn.read(worksheet=roster_ws)
     require_columns(roster_df, ROSTER_COLS, "Roster")
 
-    roster_df = roster_df[ROSTER_COLS].copy()
-    roster_df["TrueCount"] = 0
-    roster_df["LastRun"] = ""
-
-    # If someone left Preferred/Avoid as list-like, normalize back to string storage
-    # Keep as-is; you can type/edit freely in Sheets.
-
+    # Write empty frames with the headers only
+    empty_roster = pd.DataFrame(columns=ROSTER_COLS)
     empty_log = pd.DataFrame(columns=LOG_COLS)
 
-    conn.update(worksheet=roster_ws, data=roster_df)
+    conn.update(worksheet=roster_ws, data=empty_roster)
     conn.update(worksheet=log_ws, data=empty_log)
 
 
@@ -488,13 +476,13 @@ with st.sidebar:
     n_random_samples = int(st.number_input("Random samples (only if needed)", value=500, min_value=50, max_value=10000, step=50))
 
     st.divider()
-    st.header("Admin: FULL RESET")
-    st.caption("Resets TrueCount + LastRun for everyone and clears Schedule_Log. Does not delete your roster names.")
-    confirm = st.text_input('Type RESET to enable', value="")
-    if st.button("FULL RESET NOW", type="primary", disabled=(confirm.strip() != "RESET")):
+    st.header("Admin: FULL DATA CLEAR")
+    st.caption("This wipes ALL rows in Roster and Schedule_Log, leaving ONLY the column headers.")
+    confirm = st.text_input("Type CLEAR to enable", value="")
+    if st.button("CLEAR ALL DATA NOW", type="primary", disabled=(confirm.strip() != "CLEAR")):
         try:
-            full_reset(roster_ws=roster_ws, log_ws=log_ws)
-            st.success("Full reset complete. Reload the page.")
+            full_data_clear_keep_headers(roster_ws=roster_ws, log_ws=log_ws)
+            st.success("Data cleared. Roster and Schedule_Log now contain headers only. Reload the page.")
         except Exception as e:
             st.error(str(e))
 
