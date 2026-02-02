@@ -6,7 +6,20 @@ import random
 import re
 from typing import Dict, List, Tuple, Optional
 
-from st_gsheets_connection import GSheetsConnection  # <-- correct for st-gsheets-connection
+import sys
+import importlib
+import pkgutil
+
+GSheetsConnection = None
+try:
+    from st_gsheets_connection import GSheetsConnection
+except ModuleNotFoundError as e:
+    st.error(f"Missing dependency: {e}")
+    st.write("Python:", sys.version)
+    st.write("Found modules containing 'gsheet':",
+             [m.name for m in pkgutil.iter_modules() if "gsheet" in m.name.lower()])
+    st.stop()
+
 
 # =========================
 # App config
