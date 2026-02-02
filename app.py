@@ -7,12 +7,11 @@ import re
 from typing import Dict, List, Tuple, Optional
 
 import sys
-import importlib
 import pkgutil
 
 GSheetsConnection = None
 try:
-    from streamlit_gsheets import GSheetsConnection
+    from st_gsheets_connection import GSheetsConnection
 except ModuleNotFoundError as e:
     st.error(f"Missing dependency: {e}")
     st.write("Python:", sys.version)
