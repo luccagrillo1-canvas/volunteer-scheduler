@@ -12,7 +12,7 @@ import pkgutil
 
 GSheetsConnection = None
 try:
-    from st_gsheets_connection import GSheetsConnection
+    from streamlit_gsheets import GSheetsConnection
 except ModuleNotFoundError as e:
     st.error(f"Missing dependency: {e}")
     st.write("Python:", sys.version)
