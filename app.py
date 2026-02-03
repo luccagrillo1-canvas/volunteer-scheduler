@@ -1,657 +1,712 @@
+"""
+Camera Operator Scheduler V2
+Fairness-based volunteer scheduling with weighted camera positions
+"""
+
 import streamlit as st
+import gspread
+from google.oauth2.service_account import Credentials
 import pandas as pd
-from datetime import date, datetime, timezone
-import itertools
+from datetime import datetime, timezone
 import random
-import re
-from typing import Dict, List, Tuple, Optional
-
-import sys
-import pkgutil
-
-GSheetsConnection = None
-try:
-    from st_gsheets_connection import GSheetsConnection
-except ModuleNotFoundError as e:
-    st.error(f"Missing dependency: {e}")
-    st.write("Python:", sys.version)
-    st.write("Found modules containing 'gsheet':",
-             [m.name for m in pkgutil.iter_modules() if "gsheet" in m.name.lower()])
-    st.stop()
-
-
-# =========================
-# App config
-# =========================
-st.set_page_config(page_title="Volunteer Scheduler", layout="wide")
-st.title("Volunteer Scheduler (TrueCount)")
-
-conn = st.connection("gsheets", type=GSheetsConnection)
-
-DEFAULT_ROSTER_WS = "Roster"
-DEFAULT_LOG_WS = "Schedule_Log"
-
-ROSTER_COLS = [
-    "Name",
-    "RoleCapability",
-    "TrueCount",
-    "Email",
-    "SkillLevel",
-    "MedicalRestrictions",
-    "PreferredCameras",
-    "AvoidCameras",
-    "LastRun",
-]
-
-LOG_COLS = [
-    "Date",
-    "Name",
-    "RoleAssigned",
-    "GeneratedAtUTC",
-    "Notes",
-]
-
-CAMERAS_ALL = ["Cam1", "Cam2", "Cam3", "Cam4", "Cam5", "Cam6"]
-
-
-# =========================
-# Helpers
-# =========================
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-
-def normalize_list_cell(x) -> List[str]:
-    if pd.isna(x) or x is None:
-        return []
-    s = str(x).strip()
-    if not s:
-        return []
-    return [t.strip() for t in s.split(",") if t.strip()]
-
-
-def normalize_camera_token(x: str) -> str:
-    if not x:
-        return ""
-    s = str(x).strip().lower().replace(" ", "")
-    m = re.match(r"^(cam)?([1-6])$", s)
-    if m:
-        return f"Cam{m.group(2)}"
-    return str(x).strip()
-
-
-def parse_cameras_cell_to_list(x) -> List[str]:
-    cams = []
-    for token in normalize_list_cell(x):
-        cam = normalize_camera_token(token)
-        if cam in CAMERAS_ALL:
-            cams.append(cam)
-    return cams
-
-
-def require_columns(df: pd.DataFrame, required: List[str], which: str) -> None:
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"{which} sheet missing columns: {missing}. Expected exactly: {required}")
-
-
-def load_roster(roster_ws: str) -> pd.DataFrame:
-    df = conn.read(worksheet=roster_ws)
-    require_columns(df, ROSTER_COLS, "Roster")
-
-    df = df[ROSTER_COLS].copy()
-    df["Name"] = df["Name"].astype(str).str.strip()
-    df["TrueCount"] = pd.to_numeric(df["TrueCount"], errors="coerce").fillna(0).astype(int)
-
-    df["PreferredCameras"] = df["PreferredCameras"].apply(parse_cameras_cell_to_list)
-    df["AvoidCameras"] = df["AvoidCameras"].apply(parse_cameras_cell_to_list)
-
-    df["LastRun"] = df["LastRun"].fillna("").astype(str).str.strip()
-    return df
-
-
-def load_log(log_ws: str) -> pd.DataFrame:
-    try:
-        df = conn.read(worksheet=log_ws)
-    except Exception:
-        df = pd.DataFrame(columns=LOG_COLS)
-
-    if df is None or len(df) == 0:
-        return pd.DataFrame(columns=LOG_COLS)
-
-    require_columns(df, LOG_COLS, "Schedule_Log")
-    df = df[LOG_COLS].copy()
-    df["Name"] = df["Name"].fillna("").astype(str).str.strip()
-    df["RoleAssigned"] = df["RoleAssigned"].fillna("").astype(str).str.strip()
-    df["GeneratedAtUTC"] = df["GeneratedAtUTC"].fillna("").astype(str).str.strip()
-    df["Notes"] = df["Notes"].fillna("").astype(str)
-    return df
-
-
-def build_coverage_state(log_df: pd.DataFrame, window_serving_days: int) -> Dict[str, set]:
-    if log_df is None or len(log_df) == 0:
-        return {}
-
-    dates = log_df["Date"].fillna("").astype(str).str.strip().tolist()
-    unique_dates = []
-    seen = set()
-    for d in dates:
-        if d and d not in seen:
-            unique_dates.append(d)
-            seen.add(d)
-
-    window_dates = set(unique_dates[-window_serving_days:]) if unique_dates else set()
-    window_df = log_df[log_df["Date"].astype(str).isin(window_dates)].copy()
-
-    cov: Dict[str, set] = {}
-    for _, r in window_df.iterrows():
-        n = str(r["Name"]).strip()
-        cam = str(r["RoleAssigned"]).strip()
-        if n and cam in CAMERAS_ALL:
-            cov.setdefault(n, set()).add(cam)
-    return cov
-
-
-def parse_note_field(notes: str, key: str) -> Optional[str]:
-    if not notes:
-        return None
-    parts = [p.strip() for p in notes.split(";") if p.strip()]
-    for p in parts:
-        if p.lower().startswith(key.lower() + "="):
-            return p.split("=", 1)[1].strip()
-    return None
-
-
-def score_assignment(
-    person_row: pd.Series,
-    role: str,
-    role_value: int,
-    preferred_bonus: int,
-    avoid_penalty: int,
-    back_to_back_penalty: int,
-    coverage_penalty: int,
-    hard_avoid: bool,
-    hard_back_to_back: bool,
-    last_run_map: Dict[str, str],
-    coverage_map: Dict[str, set],
-) -> Tuple[bool, int, List[str]]:
-    name = str(person_row["Name"]).strip()
-    reasons: List[str] = []
-    score = 0
-
-    tc = int(person_row["TrueCount"])
-    score += tc * int(role_value)
-
-    prefs = person_row["PreferredCameras"]
-    avoids = person_row["AvoidCameras"]
-
-    if role in prefs:
-        score += preferred_bonus
-        reasons.append(f"preferred {role}")
-
-    if role in avoids:
-        if hard_avoid:
-            return False, -10**9, [f"avoid {role} blocked"]
-        score -= avoid_penalty
-        reasons.append(f"avoid {role} penalty")
-
-    last_run = last_run_map.get(name, "")
-    if last_run == role:
-        if hard_back_to_back:
-            return False, -10**9, [f"back-to-back {role} blocked"]
-        score -= back_to_back_penalty
-        reasons.append(f"back-to-back {role} penalty")
-
-    seen = coverage_map.get(name, set())
-    if role in seen:
-        score -= coverage_penalty
-        reasons.append(f"coverage repeat {role} penalty")
-    else:
-        reasons.append(f"coverage helps {role}")
-
-    return True, score, reasons
-
-
-def generate_options(
-    team_df: pd.DataFrame,
-    active_roles: List[str],
-    role_values: Dict[str, int],
-    preferred_bonus: int,
-    avoid_penalty: int,
-    back_to_back_penalty: int,
-    coverage_penalty: int,
-    hard_avoid: bool,
-    hard_back_to_back: bool,
-    enable_coverage: bool,
-    coverage_map: Dict[str, set],
-    locks: Dict[str, str],
-    n_options: int,
-    n_random_samples: int,
-) -> List[Dict]:
-    team_names = team_df["Name"].tolist()
-    if len(team_names) != len(active_roles):
-        raise ValueError("Team size must equal number of active cameras.")
-
-    last_run_map = {str(r["Name"]).strip(): str(r["LastRun"]).strip() for _, r in team_df.iterrows()}
-
-    for role, locked_name in locks.items():
-        if role not in active_roles:
-            raise ValueError(f"Locked role {role} is not active.")
-        if locked_name not in team_names:
-            raise ValueError(f"Locked name {locked_name} is not in the selected team.")
-
-    fixed_role_to_name = dict(locks)
-    fixed_name_to_role = {v: k for k, v in fixed_role_to_name.items()}
-
-    remaining_roles = [r for r in active_roles if r not in fixed_role_to_name]
-    remaining_names = [n for n in team_names if n not in fixed_name_to_role]
-
-    row_by_name = {str(r["Name"]).strip(): r for _, r in team_df.iterrows()}
-
-    def score_full_mapping(role_to_name: Dict[str, str]) -> Tuple[int, List[str], bool]:
-        total = 0
-        why_lines: List[str] = []
-        valid = True
-        cov_map = coverage_map if enable_coverage else {}
-
-        for role, name in role_to_name.items():
-            row = row_by_name[name]
-            ok, sc, reasons = score_assignment(
-                person_row=row,
-                role=role,
-                role_value=int(role_values.get(role, 0)),
-                preferred_bonus=preferred_bonus,
-                avoid_penalty=avoid_penalty,
-                back_to_back_penalty=back_to_back_penalty,
-                coverage_penalty=coverage_penalty,
-                hard_avoid=hard_avoid,
-                hard_back_to_back=hard_back_to_back,
-                last_run_map=last_run_map,
-                coverage_map=cov_map,
-            )
-            if not ok:
-                valid = False
-                break
-            total += sc
-            why_lines.append(f"{name} -> {role}: " + ", ".join(reasons))
-
-        return total, why_lines, valid
-
-    perm_count = 1
-    for i in range(2, len(remaining_roles) + 1):
-        perm_count *= i
-
-    candidates = []
-    seen_maps = set()
-
-    def add_candidate(role_to_name: Dict[str, str]):
-        key = tuple(sorted(role_to_name.items()))
-        if key in seen_maps:
-            return
-        seen_maps.add(key)
-
-        score, why, valid = score_full_mapping(role_to_name)
-        if valid:
-            candidates.append({"role_to_name": role_to_name, "score": score, "why": why})
-
-    if perm_count <= 2000:
-        for perm in itertools.permutations(remaining_names):
-            role_to_name = dict(fixed_role_to_name)
-            for role, name in zip(remaining_roles, perm):
-                role_to_name[role] = name
-            add_candidate(role_to_name)
-    else:
-        for _ in range(max(n_random_samples, n_options * 50)):
-            random.shuffle(remaining_names)
-            role_to_name = dict(fixed_role_to_name)
-            for role, name in zip(remaining_roles, remaining_names):
-                role_to_name[role] = name
-            add_candidate(role_to_name)
-
-    if not candidates:
-        raise ValueError("No valid schedules found. Relax hard blocks, coverage, or locks.")
-
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    top = candidates[:n_options]
-
-    options = []
-    for c in top:
-        assignments = [{"Name": c["role_to_name"][role], "RoleAssigned": role} for role in active_roles]
-        options.append({"assignments": assignments, "score": c["score"], "why": c["why"]})
-
-    return options
-
-
-def apply_commit(
-    roster_df: pd.DataFrame,
-    log_df: pd.DataFrame,
-    roster_ws: str,
-    log_ws: str,
-    service_date: date,
-    commit_option: Dict,
-    role_truecount_delta: Dict[str, int],
-    batch_id: str,
-) -> None:
-    now_iso = utc_now_iso()
-    date_str = service_date.isoformat()
-
-    updated_roster = roster_df.copy()
-    updated_log = log_df.copy()
-
-    for a in commit_option["assignments"]:
-        name = a["Name"]
-        role = a["RoleAssigned"]
-
-        idx = updated_roster.index[updated_roster["Name"] == name]
-        if len(idx) != 1:
-            raise ValueError(f"Roster row not found or duplicated for name: {name}")
-        i = idx[0]
-
-        prev_tc = int(updated_roster.at[i, "TrueCount"])
-        prev_lr = str(updated_roster.at[i, "LastRun"]).strip()
-
-        delta = int(role_truecount_delta.get(role, 0))
-        updated_roster.at[i, "TrueCount"] = int(prev_tc + delta)
-        updated_roster.at[i, "LastRun"] = role
-
-        notes = f"BatchID={batch_id};Delta={delta};PrevTrueCount={prev_tc};PrevLastRun={prev_lr}"
-
-        new_row = {
-            "Date": date_str,
-            "Name": name,
-            "RoleAssigned": role,
-            "GeneratedAtUTC": now_iso,
-            "Notes": notes,
-        }
-        updated_log = pd.concat([updated_log, pd.DataFrame([new_row])], ignore_index=True)
-
-    conn.update(worksheet=roster_ws, data=updated_roster[ROSTER_COLS])
-    conn.update(worksheet=log_ws, data=updated_log[LOG_COLS])
-
-
-def undo_last_commit(
-    roster_df: pd.DataFrame,
-    log_df: pd.DataFrame,
-    roster_ws: str,
-    log_ws: str,
-) -> None:
-    if log_df is None or len(log_df) == 0:
-        raise ValueError("Schedule_Log is empty. Nothing to undo.")
-
-    df = log_df.copy()
-    df["BatchID"] = df["Notes"].apply(lambda n: parse_note_field(n, "BatchID") or "")
-    df = df[df["BatchID"] != ""].copy()
-    if len(df) == 0:
-        raise ValueError("No BatchID entries found in Notes. Cannot safely undo.")
-
-    df = df.sort_values("GeneratedAtUTC", ascending=False)
-    last_batch = df.iloc[0]["BatchID"]
-
-    batch_rows = log_df[log_df["Notes"].astype(str).str.contains(f"BatchID={last_batch}", na=False)].copy()
-    if len(batch_rows) == 0:
-        raise ValueError("Last batch could not be located.")
-
-    updated_roster = roster_df.copy()
-
-    for _, r in batch_rows.iterrows():
-        name = str(r["Name"]).strip()
-        notes = str(r["Notes"])
-
-        prev_tc_str = parse_note_field(notes, "PrevTrueCount")
-        prev_lr = parse_note_field(notes, "PrevLastRun") or ""
-
-        if prev_tc_str is None:
-            raise ValueError("Cannot undo because Notes are missing PrevTrueCount.")
-
-        prev_tc = int(prev_tc_str)
-
-        idx = updated_roster.index[updated_roster["Name"] == name]
-        if len(idx) != 1:
-            raise ValueError(f"Roster row not found or duplicated for name: {name}")
-        i = idx[0]
-
-        updated_roster.at[i, "TrueCount"] = int(prev_tc)
-        updated_roster.at[i, "LastRun"] = str(prev_lr).strip()
-
-    updated_log = log_df[~log_df["Notes"].astype(str).str.contains(f"BatchID={last_batch}", na=False)].copy()
-
-    conn.update(worksheet=roster_ws, data=updated_roster[ROSTER_COLS])
-    conn.update(worksheet=log_ws, data=updated_log[LOG_COLS])
-
-
-def full_data_clear_keep_headers(roster_ws: str, log_ws: str) -> None:
-    """
-    Hard wipe:
-      - Roster tab becomes ONLY the header row (no people)
-      - Schedule_Log tab becomes ONLY the header row (no rows)
-    """
-    # Ensure roster exists and has the expected headers (so you get a clear error if wrong)
-    roster_df = conn.read(worksheet=roster_ws)
-    require_columns(roster_df, ROSTER_COLS, "Roster")
-
-    # Write empty frames with the headers only
-    empty_roster = pd.DataFrame(columns=ROSTER_COLS)
-    empty_log = pd.DataFrame(columns=LOG_COLS)
-
-    conn.update(worksheet=roster_ws, data=empty_roster)
-    conn.update(worksheet=log_ws, data=empty_log)
-
-
-# =========================
-# Sidebar
-# =========================
-with st.sidebar:
-    st.header("Sheets")
-    roster_ws = st.text_input("Roster worksheet", value=DEFAULT_ROSTER_WS)
-    log_ws = st.text_input("Schedule_Log worksheet", value=DEFAULT_LOG_WS)
-
-    st.divider()
-    st.header("Run")
-    service_date = st.date_input("Service date", value=date.today())
-
-    st.divider()
-    st.header("Active cameras")
-    active_roles = []
-    for cam in CAMERAS_ALL:
-        if st.checkbox(cam, value=True, key=f"active_{cam}"):
-            active_roles.append(cam)
-
-    st.divider()
-    st.header("Role values (who is due for premium roles)")
-    role_values: Dict[str, int] = {}
-    for cam in CAMERAS_ALL:
-        default_val = {"Cam1": -2, "Cam2": -2, "Cam3": 0, "Cam4": 2, "Cam5": 4, "Cam6": 5}.get(cam, 0)
-        role_values[cam] = int(st.number_input(f"{cam} value", value=int(default_val), step=1, key=f"val_{cam}"))
-
-    st.divider()
-    st.header("TrueCount deltas on commit")
-    role_truecount_delta: Dict[str, int] = {}
-    for cam in CAMERAS_ALL:
-        default_delta = {"Cam1": +1, "Cam2": +1, "Cam3": 0, "Cam4": -1, "Cam5": -2, "Cam6": -3}.get(cam, 0)
-        role_truecount_delta[cam] = int(st.number_input(f"{cam} delta", value=int(default_delta), step=1, key=f"delta_{cam}"))
-
-    st.divider()
-    st.header("Rules")
-    hard_avoid = st.checkbox("Hard block AvoidCameras", value=True)
-    hard_back_to_back = st.checkbox("Hard block back-to-back same camera", value=False)
-    enable_coverage = st.checkbox("Enable coverage rule", value=True)
-    coverage_window_days = int(st.number_input("Coverage window (serving days)", value=10, step=1, min_value=1))
-
-    preferred_bonus = int(st.number_input("Preferred bonus", value=20, step=1))
-    avoid_penalty = int(st.number_input("Avoid penalty", value=50, step=1))
-    back_to_back_penalty = int(st.number_input("Back-to-back penalty", value=40, step=1))
-    coverage_penalty = int(st.number_input("Coverage repeat penalty", value=10, step=1))
-
-    st.divider()
-    st.header("Generate")
-    n_options = int(st.number_input("How many options (3-5 recommended)", value=5, min_value=1, max_value=10, step=1))
-    n_random_samples = int(st.number_input("Random samples (only if needed)", value=500, min_value=50, max_value=10000, step=50))
-
-    st.divider()
-    st.header("Admin: FULL DATA CLEAR")
-    st.caption("This wipes ALL rows in Roster and Schedule_Log, leaving ONLY the column headers.")
-    confirm = st.text_input("Type CLEAR to enable", value="")
-    if st.button("CLEAR ALL DATA NOW", type="primary", disabled=(confirm.strip() != "CLEAR")):
-        try:
-            full_data_clear_keep_headers(roster_ws=roster_ws, log_ws=log_ws)
-            st.success("Data cleared. Roster and Schedule_Log now contain headers only. Reload the page.")
-        except Exception as e:
-            st.error(str(e))
-
-
-# =========================
-# Load Data
-# =========================
-colA, colB = st.columns([1, 1])
-
-with colA:
-    st.subheader("Roster")
-    try:
-        roster = load_roster(roster_ws)
-        st.dataframe(roster[ROSTER_COLS], use_container_width=True)
-    except Exception as e:
-        st.error(str(e))
-        st.stop()
-
-with colB:
-    st.subheader("Schedule_Log (latest)")
-    try:
-        schedule_log = load_log(log_ws)
-        if len(schedule_log) > 0:
-            st.dataframe(schedule_log.tail(12), use_container_width=True)
-        else:
-            st.info("Schedule_Log is empty.")
-    except Exception as e:
-        st.error(str(e))
-        st.stop()
-
-
-# =========================
-# Due list
-# =========================
-st.divider()
-st.subheader("Due list (highest TrueCount)")
-due = roster[["Name", "TrueCount", "LastRun", "PreferredCameras", "AvoidCameras"]].copy()
-due = due.sort_values("TrueCount", ascending=False)
-st.dataframe(due, use_container_width=True)
-
-
-# =========================
-# Team selection + locks + generate + commit + undo
-# =========================
-st.divider()
-st.subheader("Pick today's team, generate options, commit one")
-
-if len(active_roles) == 0:
-    st.error("Select at least one camera in the sidebar.")
-    st.stop()
-
-team_names_all = roster["Name"].tolist()
-team_selected = st.multiselect(
-    f"Select today's team (must equal {len(active_roles)} people)",
-    options=team_names_all,
-    default=[],
+from typing import List, Dict, Tuple, Optional
+from collections import defaultdict
+import json
+
+# Page configuration
+st.set_page_config(
+    page_title="Camera Scheduler V2",
+    page_icon="🎥",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-if len(team_selected) != len(active_roles):
-    st.warning(f"Select exactly {len(active_roles)} people (you selected {len(team_selected)}).")
+# Camera weights (higher = more desirable)
+CAMERA_WEIGHTS = {
+    "Cam1": 1,
+    "Cam2": 1,
+    "Cam3": 2,
+    "Cam4": 2,
+    "Cam5": 3,
+    "Cam6": 4
+}
+
+CAMERAS = list(CAMERA_WEIGHTS.keys())
+COVERAGE_WINDOW = 10  # Days to track camera coverage
+
+# Google Sheets setup
+@st.cache_resource
+def get_google_sheets_client():
+    """Initialize Google Sheets client with credentials from Streamlit secrets"""
+    try:
+        creds_dict = st.secrets["gcp_service_account"]
+        creds = Credentials.from_service_account_info(
+            creds_dict,
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"
+            ]
+        )
+        return gspread.authorize(creds)
+    except Exception as e:
+        st.error(f"Failed to initialize Google Sheets: {e}")
+        st.stop()
+
+def get_spreadsheet():
+    """Get the main spreadsheet"""
+    try:
+        client = get_google_sheets_client()
+        sheet_url = st.secrets.get("sheet_url", "")
+        if not sheet_url:
+            st.error("Sheet URL not found in secrets. Please add 'sheet_url' to your Streamlit secrets.")
+            st.stop()
+        return client.open_by_url(sheet_url)
+    except Exception as e:
+        st.error(f"Failed to open spreadsheet: {e}")
+        st.stop()
+
+def load_roster() -> pd.DataFrame:
+    """Load roster data from Google Sheet"""
+    try:
+        spreadsheet = get_spreadsheet()
+        roster_sheet = spreadsheet.worksheet("Roster")
+        data = roster_sheet.get_all_records()
+        df = pd.DataFrame(data)
+
+        # Ensure required columns exist
+        required_cols = ["Name", "RoleCapability", "TrueCount", "Email",
+                        "SkillLevel", "MedicalRestrictions", "PreferredCameras",
+                        "AvoidCameras", "LastRun"]
+        for col in required_cols:
+            if col not in df.columns:
+                df[col] = ""
+
+        # Convert TrueCount to numeric
+        df["TrueCount"] = pd.to_numeric(df["TrueCount"], errors="coerce").fillna(0)
+
+        return df
+    except Exception as e:
+        st.error(f"Failed to load roster: {e}")
+        return pd.DataFrame()
+
+def load_schedule_log() -> pd.DataFrame:
+    """Load schedule log from Google Sheet"""
+    try:
+        spreadsheet = get_spreadsheet()
+        try:
+            log_sheet = spreadsheet.worksheet("Schedule_Log")
+        except gspread.exceptions.WorksheetNotFound:
+            # Create Schedule_Log if it doesn't exist
+            log_sheet = spreadsheet.add_worksheet("Schedule_Log", rows=100, cols=10)
+            log_sheet.update('A1:E1', [["Date", "Name", "RoleAssigned", "GeneratedAtUTC", "Notes"]])
+            return pd.DataFrame(columns=["Date", "Name", "RoleAssigned", "GeneratedAtUTC", "Notes"])
+
+        data = log_sheet.get_all_records()
+        return pd.DataFrame(data)
+    except Exception as e:
+        st.error(f"Failed to load schedule log: {e}")
+        return pd.DataFrame()
+
+def save_roster(df: pd.DataFrame):
+    """Save roster data back to Google Sheet"""
+    try:
+        spreadsheet = get_spreadsheet()
+        roster_sheet = spreadsheet.worksheet("Roster")
+
+        # Convert dataframe to list of lists
+        values = [df.columns.tolist()] + df.values.tolist()
+        roster_sheet.clear()
+        roster_sheet.update('A1', values)
+
+        st.success("✅ Roster updated successfully!")
+    except Exception as e:
+        st.error(f"Failed to save roster: {e}")
+
+def append_to_log(assignments: Dict[str, str], service_date: str, notes: str = ""):
+    """Append new assignments to schedule log"""
+    try:
+        spreadsheet = get_spreadsheet()
+        log_sheet = spreadsheet.worksheet("Schedule_Log")
+
+        timestamp = datetime.now(timezone.utc).isoformat()
+        rows = []
+        for person, camera in assignments.items():
+            rows.append([service_date, person, camera, timestamp, notes])
+
+        if rows:
+            log_sheet.append_rows(rows)
+            st.success(f"✅ Logged {len(rows)} assignments")
+    except Exception as e:
+        st.error(f"Failed to append to log: {e}")
+
+def get_recent_assignments(person: str, log_df: pd.DataFrame, window: int = COVERAGE_WINDOW) -> List[str]:
+    """Get recent camera assignments for a person"""
+    person_log = log_df[log_df["Name"] == person].tail(window)
+    return person_log["RoleAssigned"].tolist()
+
+def calculate_coverage_score(person: str, camera: str, log_df: pd.DataFrame) -> float:
+    """
+    Calculate coverage score - higher score for cameras not recently used
+    Returns: 0-1, where 1 = hasn't used this camera recently
+    """
+    recent = get_recent_assignments(person, log_df, COVERAGE_WINDOW)
+    if not recent:
+        return 1.0
+
+    # Count how many times they've used this camera recently
+    count = recent.count(camera)
+    # Return inverse - higher score if less usage
+    return max(0, 1 - (count / len(recent)))
+
+def calculate_back_to_back_penalty(person: str, camera: str, log_df: pd.DataFrame) -> float:
+    """
+    Calculate penalty for back-to-back same camera assignment
+    Returns: 0-1, where 0 = just used this camera, 1 = no recent usage
+    """
+    if log_df.empty:
+        return 1.0
+
+    person_log = log_df[log_df["Name"] == person]
+    if person_log.empty:
+        return 1.0
+
+    last_camera = person_log.iloc[-1]["RoleAssigned"]
+    if last_camera == camera:
+        return 0.0  # Heavy penalty for same camera
+    else:
+        return 1.0  # No penalty
+
+def parse_camera_list(camera_str: str) -> List[str]:
+    """Parse comma-separated camera list"""
+    if not camera_str or pd.isna(camera_str):
+        return []
+    return [cam.strip() for cam in str(camera_str).split(",") if cam.strip()]
+
+def calculate_preference_score(person_data: pd.Series, camera: str) -> float:
+    """
+    Calculate preference score
+    Returns: 0-1.5, where >1 = preferred, <1 = avoided
+    """
+    preferred = parse_camera_list(person_data.get("PreferredCameras", ""))
+    avoided = parse_camera_list(person_data.get("AvoidCameras", ""))
+
+    if camera in preferred:
+        return 1.3  # Bonus for preferred
+    elif camera in avoided:
+        return 0.7  # Penalty for avoided
+    else:
+        return 1.0  # Neutral
+
+def generate_schedule_option(
+    available_people: List[str],
+    roster_df: pd.DataFrame,
+    log_df: pd.DataFrame,
+    locked_assignments: Dict[str, str] = None
+) -> Tuple[Dict[str, str], Dict[str, Dict[str, float]]]:
+    """
+    Generate one schedule option using weighted scoring
+    Returns: (assignments, scoring_details)
+    """
+    locked_assignments = locked_assignments or {}
+    assignments = locked_assignments.copy()
+    remaining_cameras = [cam for cam in CAMERAS if cam not in assignments.values()]
+    remaining_people = [p for p in available_people if p not in assignments.keys()]
+
+    scoring_details = {}
+
+    # Build scoring matrix
+    scores = defaultdict(dict)
+    for person in remaining_people:
+        person_data = roster_df[roster_df["Name"] == person].iloc[0]
+        true_count = person_data["TrueCount"]
+
+        for camera in remaining_cameras:
+            # Calculate component scores
+            weight = CAMERA_WEIGHTS[camera]
+            fairness_score = 1.0 / (true_count + 1)  # Lower TrueCount = higher priority
+            coverage_score = calculate_coverage_score(person, camera, log_df)
+            back_to_back_score = calculate_back_to_back_penalty(person, camera, log_df)
+            preference_score = calculate_preference_score(person_data, camera)
+
+            # Combined score with weights
+            total_score = (
+                fairness_score * 2.0 +      # Fairness is most important
+                coverage_score * 1.5 +       # Coverage is important
+                back_to_back_score * 1.5 +   # Avoid back-to-back
+                preference_score * 1.0 +     # Honor preferences
+                (weight * 0.3)               # Give high cameras slightly to those who deserve it
+            )
+
+            # Add small random factor to break ties
+            total_score += random.random() * 0.1
+
+            scores[person][camera] = total_score
+
+            # Store details for explanation
+            scoring_details[f"{person}-{camera}"] = {
+                "fairness": fairness_score,
+                "coverage": coverage_score,
+                "back_to_back": back_to_back_score,
+                "preference": preference_score,
+                "camera_weight": weight,
+                "total": total_score
+            }
+
+    # Greedy assignment - assign highest scoring person-camera pairs
+    while remaining_people and remaining_cameras:
+        # Find best assignment
+        best_person = None
+        best_camera = None
+        best_score = -1
+
+        for person in remaining_people:
+            for camera in remaining_cameras:
+                if scores[person][camera] > best_score:
+                    best_score = scores[person][camera]
+                    best_person = person
+                    best_camera = camera
+
+        if best_person and best_camera:
+            assignments[best_person] = best_camera
+            remaining_people.remove(best_person)
+            remaining_cameras.remove(best_camera)
+        else:
+            break
+
+    return assignments, scoring_details
+
+def explain_assignment(person: str, camera: str, scoring_details: Dict, roster_df: pd.DataFrame) -> str:
+    """Generate human-readable explanation for an assignment"""
+    key = f"{person}-{camera}"
+    if key not in scoring_details:
+        return "N/A"
+
+    details = scoring_details[key]
+    person_data = roster_df[roster_df["Name"] == person].iloc[0]
+    true_count = person_data["TrueCount"]
+
+    reasons = []
+
+    # Fairness
+    if details["fairness"] > 0.5:
+        reasons.append(f"Low TrueCount ({true_count:.1f}) - due for better cameras")
+
+    # Coverage
+    if details["coverage"] > 0.7:
+        reasons.append(f"Hasn't run {camera} recently")
+
+    # Back-to-back
+    if details["back_to_back"] == 0:
+        reasons.append(f"⚠️ Just ran {camera} last time")
+
+    # Preference
+    preferred = parse_camera_list(person_data.get("PreferredCameras", ""))
+    avoided = parse_camera_list(person_data.get("AvoidCameras", ""))
+    if camera in preferred:
+        reasons.append(f"✅ Preferred camera")
+    elif camera in avoided:
+        reasons.append(f"⚠️ Avoided camera")
+
+    # Camera weight
+    weight = CAMERA_WEIGHTS[camera]
+    if weight >= 3:
+        reasons.append(f"Premium camera (weight {weight})")
+
+    return " | ".join(reasons) if reasons else "Standard assignment"
+
+def calculate_option_summary(assignments: Dict[str, str], roster_df: pd.DataFrame) -> Dict:
+    """Calculate summary statistics for a schedule option"""
+    total_weight = sum(CAMERA_WEIGHTS[cam] for cam in assignments.values())
+    avg_true_count = roster_df[roster_df["Name"].isin(assignments.keys())]["TrueCount"].mean()
+
+    premium_assignments = sum(1 for cam in assignments.values() if CAMERA_WEIGHTS[cam] >= 3)
+
+    return {
+        "total_weight": total_weight,
+        "avg_true_count": avg_true_count,
+        "premium_assignments": premium_assignments
+    }
+
+# ============= STREAMLIT UI =============
+
+st.title("🎥 Camera Operator Scheduler V2")
+st.markdown("**Fairness-based scheduling with weighted camera positions**")
+
+# Load data
+roster_df = load_roster()
+log_df = load_schedule_log()
+
+if roster_df.empty:
+    st.error("⚠️ No roster data found. Please set up your Roster tab in Google Sheets.")
     st.stop()
 
-team_df = roster[roster["Name"].isin(team_selected)].copy()
-coverage_map = build_coverage_state(schedule_log, window_serving_days=coverage_window_days)
+# Sidebar
+with st.sidebar:
+    st.header("⚙️ Settings")
+    service_date = st.date_input("Service Date", datetime.now())
 
-st.markdown("### Locks (optional)")
-if "locks" not in st.session_state:
-    st.session_state["locks"] = {}
+    st.markdown("---")
+    st.subheader("📊 Camera Weights")
+    for cam, weight in CAMERA_WEIGHTS.items():
+        st.text(f"{cam}: {'⭐' * weight}")
 
-lock_cols = st.columns(3)
-with lock_cols[0]:
-    lock_role = st.selectbox("Role to lock", options=["(none)"] + active_roles, index=0)
-with lock_cols[1]:
-    lock_name = st.selectbox("Person", options=["(none)"] + team_selected, index=0)
-with lock_cols[2]:
-    if st.button("Add/Update lock"):
-        if lock_role != "(none)" and lock_name != "(none)":
-            st.session_state["locks"][lock_role] = lock_name
+    st.markdown("---")
+    if st.button("🔄 Refresh Data", use_container_width=True):
+        st.cache_resource.clear()
+        st.rerun()
 
-if st.button("Clear locks"):
-    st.session_state["locks"] = {}
+# Tabs
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📅 Generate Schedule",
+    "👥 Due List",
+    "⚙️ Admin Tools",
+    "📊 Roster View",
+    "📜 Schedule History"
+])
 
-locks = dict(st.session_state["locks"])
-if locks:
-    st.write("Current locks:")
-    st.json(locks)
+# TAB 1: Generate Schedule
+with tab1:
+    st.header("Generate Schedule Options")
 
-st.markdown("### Generate options")
-if st.button("Generate options", type="primary"):
-    try:
-        options = generate_options(
-            team_df=team_df,
-            active_roles=active_roles,
-            role_values=role_values,
-            preferred_bonus=preferred_bonus,
-            avoid_penalty=avoid_penalty,
-            back_to_back_penalty=back_to_back_penalty,
-            coverage_penalty=coverage_penalty,
-            hard_avoid=hard_avoid,
-            hard_back_to_back=hard_back_to_back,
-            enable_coverage=enable_coverage,
-            coverage_map=coverage_map,
-            locks=locks,
-            n_options=n_options,
-            n_random_samples=n_random_samples,
-        )
-        st.session_state["options"] = options
-        st.success(f"Generated {len(options)} option(s).")
-    except Exception as e:
-        st.error(str(e))
+    # Team selection
+    st.subheader("1️⃣ Select Team Members")
+    all_names = sorted(roster_df["Name"].tolist())
+    selected_team = st.multiselect(
+        "Select 6 camera operators for this service:",
+        options=all_names,
+        default=all_names[:6] if len(all_names) >= 6 else all_names
+    )
 
-if "options" in st.session_state:
-    options = st.session_state["options"]
+    if len(selected_team) != 6:
+        st.warning(f"⚠️ Please select exactly 6 operators. Currently selected: {len(selected_team)}")
 
-    st.markdown("### Options")
-    for i, opt in enumerate(options, start=1):
-        with st.expander(f"Option {i}  |  Score: {opt['score']}", expanded=(i == 1)):
-            df_opt = pd.DataFrame(opt["assignments"])
-            st.dataframe(df_opt, use_container_width=True)
+    # Locked assignments
+    st.subheader("2️⃣ Lock Assignments (Optional)")
+    st.caption("Lock specific people to cameras before generating options")
 
-            st.markdown("**Why this option**")
-            for line in opt["why"][:30]:
-                st.write("- " + line)
-
-    st.markdown("### Commit one option")
-    option_index = st.number_input("Option number", min_value=1, max_value=len(options), value=1, step=1)
-
-    if st.button("Commit selected option", type="secondary"):
-        try:
-            chosen = options[int(option_index) - 1]
-            batch_id = f"{utc_now_iso()}_{random.randint(1000,9999)}"
-            apply_commit(
-                roster_df=conn.read(worksheet=roster_ws),
-                log_df=load_log(log_ws),
-                roster_ws=roster_ws,
-                log_ws=log_ws,
-                service_date=service_date,
-                commit_option=chosen,
-                role_truecount_delta=role_truecount_delta,
-                batch_id=batch_id,
+    locked_assignments = {}
+    lock_cols = st.columns(3)
+    for i in range(2):  # Allow up to 2 locks
+        with lock_cols[i]:
+            person = st.selectbox(
+                f"Lock Person {i+1}",
+                options=[""] + selected_team,
+                key=f"lock_person_{i}"
             )
-            st.success(f"Committed. BatchID: {batch_id}")
-            st.session_state.pop("options", None)
-            st.info("Reload the page to see updated tables.")
-        except Exception as e:
-            st.error(str(e))
+            if person:
+                available_cameras = [c for c in CAMERAS if c not in locked_assignments.values()]
+                camera = st.selectbox(
+                    f"to Camera",
+                    options=available_cameras,
+                    key=f"lock_camera_{i}"
+                )
+                if camera:
+                    locked_assignments[person] = camera
 
-    st.markdown("### Undo last commit")
-    if st.button("Undo last committed schedule", type="secondary"):
-        try:
-            undo_last_commit(
-                roster_df=conn.read(worksheet=roster_ws),
-                log_df=load_log(log_ws),
-                roster_ws=roster_ws,
-                log_ws=log_ws,
+    if locked_assignments:
+        st.info(f"🔒 Locked: {', '.join([f'{p}→{c}' for p, c in locked_assignments.items()])}")
+
+    # Generate options
+    st.subheader("3️⃣ Generate Options")
+    num_options = st.slider("Number of options to generate:", 3, 5, 3)
+
+    if st.button("🎲 Generate Schedule Options", type="primary", use_container_width=True):
+        if len(selected_team) != 6:
+            st.error("⚠️ Please select exactly 6 operators")
+        else:
+            with st.spinner("Generating optimal schedules..."):
+                options = []
+                for i in range(num_options):
+                    assignments, scoring_details = generate_schedule_option(
+                        selected_team,
+                        roster_df,
+                        log_df,
+                        locked_assignments
+                    )
+                    summary = calculate_option_summary(assignments, roster_df)
+                    options.append({
+                        "assignments": assignments,
+                        "scoring_details": scoring_details,
+                        "summary": summary
+                    })
+
+                st.session_state.generated_options = options
+                st.session_state.selected_option_idx = None
+                st.success(f"✅ Generated {len(options)} schedule options!")
+
+    # Display options
+    if "generated_options" in st.session_state:
+        st.markdown("---")
+        st.subheader("📋 Schedule Options")
+
+        for idx, option in enumerate(st.session_state.generated_options):
+            with st.expander(f"**Option {idx + 1}** - Total Weight: {option['summary']['total_weight']} | Premium: {option['summary']['premium_assignments']}/6", expanded=(idx == 0)):
+
+                # Assignment table
+                assignment_data = []
+                for person, camera in sorted(option["assignments"].items(),
+                                            key=lambda x: CAMERAS.index(x[1])):
+                    person_data = roster_df[roster_df["Name"] == person].iloc[0]
+                    true_count = person_data["TrueCount"]
+                    explanation = explain_assignment(person, camera, option["scoring_details"], roster_df)
+
+                    assignment_data.append({
+                        "Camera": camera,
+                        "Operator": person,
+                        "TrueCount": f"{true_count:.1f}",
+                        "Weight": CAMERA_WEIGHTS[camera],
+                        "Why?": explanation
+                    })
+
+                df_display = pd.DataFrame(assignment_data)
+                st.dataframe(df_display, use_container_width=True, hide_index=True)
+
+                # Select button
+                col1, col2 = st.columns([3, 1])
+                with col2:
+                    if st.button(f"✅ Select Option {idx + 1}", key=f"select_{idx}", use_container_width=True):
+                        st.session_state.selected_option_idx = idx
+                        st.success(f"Selected Option {idx + 1}!")
+
+        # Commit selected option
+        if st.session_state.get("selected_option_idx") is not None:
+            st.markdown("---")
+            st.subheader("💾 Commit Schedule")
+
+            selected_idx = st.session_state.selected_option_idx
+            selected_option = st.session_state.generated_options[selected_idx]
+
+            st.info(f"Ready to commit **Option {selected_idx + 1}**")
+
+            commit_notes = st.text_input("Notes (optional):", placeholder="e.g., Sunday morning service")
+
+            if st.button("💾 Commit to Schedule", type="primary", use_container_width=True):
+                with st.spinner("Committing schedule..."):
+                    # Update TrueCounts
+                    for person, camera in selected_option["assignments"].items():
+                        weight = CAMERA_WEIGHTS[camera]
+                        roster_df.loc[roster_df["Name"] == person, "TrueCount"] += weight
+                        roster_df.loc[roster_df["Name"] == person, "LastRun"] = str(service_date)
+
+                    # Save roster
+                    save_roster(roster_df)
+
+                    # Log assignments
+                    append_to_log(selected_option["assignments"], str(service_date), commit_notes)
+
+                    # Clear session state
+                    del st.session_state.generated_options
+                    del st.session_state.selected_option_idx
+
+                    st.success("🎉 Schedule committed successfully!")
+                    st.balloons()
+                    st.rerun()
+
+# TAB 2: Due List
+with tab2:
+    st.header("📊 Due List - Premium Camera Priority")
+    st.caption("Ranked by who deserves premium cameras (Cam5, Cam6) most")
+
+    # Calculate "due score" for premium cameras
+    due_data = []
+    for _, person in roster_df.iterrows():
+        name = person["Name"]
+        true_count = person["TrueCount"]
+
+        # Get recent premium camera usage
+        recent = get_recent_assignments(name, log_df, COVERAGE_WINDOW)
+        premium_count = sum(1 for cam in recent if CAMERA_WEIGHTS.get(cam, 0) >= 3)
+        premium_ratio = premium_count / len(recent) if recent else 0
+
+        # Calculate due score (lower TrueCount + less premium usage = higher score)
+        due_score = (1 / (true_count + 1)) * 100 + (1 - premium_ratio) * 50
+
+        due_data.append({
+            "Rank": 0,
+            "Name": name,
+            "TrueCount": f"{true_count:.1f}",
+            "Recent Premium": f"{premium_count}/{len(recent) if recent else 0}",
+            "Due Score": f"{due_score:.1f}",
+            "Last Served": person.get("LastRun", "Never")
+        })
+
+    # Sort by due score
+    due_df = pd.DataFrame(due_data)
+    due_df = due_df.sort_values("Due Score", ascending=False)
+    due_df["Rank"] = range(1, len(due_df) + 1)
+
+    # Display with color coding
+    st.dataframe(
+        due_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Rank": st.column_config.NumberColumn("Rank", format="%d"),
+            "Due Score": st.column_config.NumberColumn("Due Score", format="%.1f")
+        }
+    )
+
+    st.caption("💡 Higher Due Score = More deserving of premium cameras (Cam5, Cam6)")
+
+# TAB 3: Admin Tools
+with tab3:
+    st.header("⚙️ Admin Tools")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("🔙 Undo Last Schedule")
+        st.caption("Revert TrueCount and remove last log entries")
+
+        if not log_df.empty:
+            last_date = log_df.iloc[-1]["Date"] if not log_df.empty else "N/A"
+            last_count = len(log_df[log_df["Date"] == last_date]) if not log_df.empty else 0
+            st.info(f"Last schedule: **{last_date}** ({last_count} assignments)")
+
+            if st.button("🔙 Undo Last Schedule", use_container_width=True):
+                if st.button("⚠️ Confirm Undo", use_container_width=True, type="primary"):
+                    with st.spinner("Reverting changes..."):
+                        # Get last schedule entries
+                        last_entries = log_df[log_df["Date"] == last_date]
+
+                        # Revert TrueCounts
+                        for _, entry in last_entries.iterrows():
+                            person = entry["Name"]
+                            camera = entry["RoleAssigned"]
+                            weight = CAMERA_WEIGHTS.get(camera, 0)
+                            roster_df.loc[roster_df["Name"] == person, "TrueCount"] -= weight
+
+                        # Save roster
+                        save_roster(roster_df)
+
+                        # Remove log entries
+                        try:
+                            spreadsheet = get_spreadsheet()
+                            log_sheet = spreadsheet.worksheet("Schedule_Log")
+                            # Delete last N rows
+                            num_rows = len(last_entries)
+                            current_rows = len(log_sheet.get_all_values())
+                            if num_rows > 0:
+                                log_sheet.delete_rows(current_rows - num_rows + 1, current_rows)
+                            st.success(f"✅ Undone {num_rows} assignments from {last_date}")
+                        except Exception as e:
+                            st.error(f"Failed to remove log entries: {e}")
+
+                        st.rerun()
+        else:
+            st.warning("No schedules to undo")
+
+    with col2:
+        st.subheader("👤 Admin Override")
+        st.caption("Manually assign someone (updates TrueCount)")
+
+        override_person = st.selectbox("Select Person:", roster_df["Name"].tolist())
+        override_camera = st.selectbox("Assign to Camera:", CAMERAS)
+        override_date = st.date_input("Service Date:", datetime.now(), key="override_date")
+
+        if st.button("✅ Apply Override", use_container_width=True):
+            with st.spinner("Applying override..."):
+                weight = CAMERA_WEIGHTS[override_camera]
+                roster_df.loc[roster_df["Name"] == override_person, "TrueCount"] += weight
+                roster_df.loc[roster_df["Name"] == override_person, "LastRun"] = str(override_date)
+
+                save_roster(roster_df)
+                append_to_log({override_person: override_camera}, str(override_date), "Admin override")
+
+                st.success(f"✅ {override_person} → {override_camera} (TrueCount +{weight})")
+                st.rerun()
+
+    st.markdown("---")
+
+    # Full Reset
+    st.subheader("🚨 Full Reset")
+    st.caption("⚠️ Clears all TrueCounts and schedule history. Column headers remain intact.")
+
+    if st.button("🚨 Full Reset (Danger Zone)", use_container_width=True):
+        with st.expander("⚠️ Confirm Full Reset", expanded=True):
+            st.error("This will reset ALL TrueCounts to 0 and clear the entire schedule history!")
+
+            confirm_text = st.text_input("Type 'RESET' to confirm:")
+
+            if confirm_text == "RESET":
+                if st.button("🔥 CONFIRM FULL RESET", type="primary", use_container_width=True):
+                    with st.spinner("Resetting all data..."):
+                        # Reset TrueCounts
+                        roster_df["TrueCount"] = 0
+                        roster_df["LastRun"] = ""
+                        save_roster(roster_df)
+
+                        # Clear schedule log (keep headers)
+                        try:
+                            spreadsheet = get_spreadsheet()
+                            log_sheet = spreadsheet.worksheet("Schedule_Log")
+                            log_sheet.clear()
+                            log_sheet.update('A1:E1', [["Date", "Name", "RoleAssigned", "GeneratedAtUTC", "Notes"]])
+                            st.success("✅ Full reset completed!")
+                        except Exception as e:
+                            st.error(f"Failed to clear log: {e}")
+
+                        st.rerun()
+
+# TAB 4: Roster View
+with tab4:
+    st.header("👥 Roster Management")
+
+    st.dataframe(
+        roster_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "TrueCount": st.column_config.NumberColumn("TrueCount", format="%.1f"),
+            "Email": st.column_config.TextColumn("Email"),
+            "PreferredCameras": st.column_config.TextColumn("Preferred"),
+            "AvoidCameras": st.column_config.TextColumn("Avoid")
+        }
+    )
+
+    st.caption("💡 Edit data directly in Google Sheets, then click 'Refresh Data' in sidebar")
+
+# TAB 5: Schedule History
+with tab5:
+    st.header("📜 Schedule History")
+
+    if not log_df.empty:
+        # Show summary stats
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Schedules", len(log_df["Date"].unique()))
+        with col2:
+            st.metric("Total Assignments", len(log_df))
+        with col3:
+            last_date = log_df.iloc[-1]["Date"]
+            st.metric("Last Schedule", last_date)
+
+        st.markdown("---")
+
+        # Filter by date range
+        if len(log_df) > 0:
+            date_filter = st.selectbox(
+                "Filter by:",
+                ["All History", "Last 5 Schedules", "Last 10 Schedules"]
             )
-            st.success("Undid last commit. Reload the page to see updated tables.")
-            st.session_state.pop("options", None)
-        except Exception as e:
-            st.error(str(e))
+
+            if date_filter == "Last 5 Schedules":
+                unique_dates = log_df["Date"].unique()[-5:]
+                filtered_log = log_df[log_df["Date"].isin(unique_dates)]
+            elif date_filter == "Last 10 Schedules":
+                unique_dates = log_df["Date"].unique()[-10:]
+                filtered_log = log_df[log_df["Date"].isin(unique_dates)]
+            else:
+                filtered_log = log_df
+
+            st.dataframe(
+                filtered_log,
+                use_container_width=True,
+                hide_index=True
+            )
+    else:
+        st.info("No schedule history yet. Generate your first schedule in the 'Generate Schedule' tab!")
+
+# Footer
+st.markdown("---")
+st.caption("🎥 Camera Scheduler V2 | Built with Streamlit | TrueCount Fairness System")
